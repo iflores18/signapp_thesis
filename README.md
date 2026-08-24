@@ -27,7 +27,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 **2. Clone and set up the project:**
 ```bash
 git clone https://github.com/iflores18/signapp_thesis.git
-cd slr-thesis
+cd signapp_thesis
 uv sync
 ```
 
@@ -73,7 +73,7 @@ python main.py
 ## Project Structure
 
 ```
-slr-thesis/
+signapp_thesis/
 ├── pyproject.toml        # Project config and dependencies
 ├── uv.lock               # Locked dependency versions
 ├── requirements.txt      # For pip-based setup
