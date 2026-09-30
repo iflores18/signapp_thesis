@@ -212,23 +212,117 @@ class TransformerTemporalCell(nn.Module):
 
 
 class BiLSTMTemporalCell(nn.Module):
-    """Bidirectional LSTM over the frame axis. Not implemented yet.
+    """Bidirectional LSTM over the frame axis.
 
-    Notes for when it is: packing is mandatory, not an optimisation -- the
-    backward pass would otherwise start inside the padding and read it before
-    reaching any real frame. Output width is 2 * hidden when concatenating, so
-    `out_channels` is a real constraint here, unlike in the Transformer cell.
+    The counterpart to the Transformer cell in the temporal axis of the
+    comparison: unbounded and order-constitutive, where the other arm is
+    bounded-local and order-tagged.
+
+    Width
+    -----
+    nn.LSTM concatenates the forward and backward states, so the output is
+    2 * hidden wide. `hidden` is therefore derived as `out_channels // 2` and
+    `out_channels` must be even. Unlike the Transformer cell, `out_channels`
+    may differ from `in_channels` -- this cell projects by nature, and copying
+    the other cell's equal-widths guard would be wrong here. At
+    `out_channels=64` the arms are width-matched with `hidden=32`.
+
+    What this cell deliberately does not have
+    ----------------------------------------
+    No positional encoding: order is intrinsic to recurrence, not something
+    added to the input. No convolution: the convs are the Transformer arm's
+    temporal inductive bias, and putting them here would erase the contrast the
+    experiment is built on. No internal residual connections or LayerNorm: the
+    cell state carries gradients, and adding them would invent a non-standard
+    component. Symmetry between the arms lives at the seam in `model.py`, where
+    the residual and LayerNorm wrap both identically.
+
+    Dropout
+    -------
+    nn.LSTM applies dropout only *between* layers, so at `num_layers=1` there is
+    none -- while the Transformer cell has dropout inside every encoder layer
+    regardless of depth. That asymmetry is real and belongs in the setup table
+    rather than being papered over here.
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        dropout: float = 0.1,
         num_layers: int = 1,
+        dropout: float = 0.1,
     ):
         super().__init__()
-        raise NotImplementedError
+        if out_channels % 2 != 0:
+            raise ValueError(
+                f"out_channels must be even: a bidirectional LSTM concatenates "
+                f"two directions of width hidden, so out_channels = 2 * hidden. "
+                f"Got {out_channels}."
+            )
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.hidden = out_channels // 2
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        self.lstm = nn.LSTM(
+            input_size=in_channels,
+            hidden_size=self.hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            # Passing a non-zero value at num_layers=1 does nothing except emit
+            # a warning: nn.LSTM only applies dropout between stacked layers.
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        """
+        x:    [N, V, T, C_in]
+        mask: [N, T] bool, True = real frame
+        returns: [N, V, T, C_out]
+        """
+        if x.dim() != 4:
+            raise ValueError(f"expected [N, V, T, C], got {tuple(x.shape)}")
+        N, V, T, C = x.shape
+        if C != self.in_channels:
+            raise ValueError(f"expected {self.in_channels} channels, got {C}")
+        if mask.shape != (N, T):
+            raise ValueError(f"expected mask [{N}, {T}], got {tuple(mask.shape)}")
+        # pack_padded_sequence does reject a length of 0, but with a message
+        # about the packing internals rather than about the batch. More
+        # generally, what a malformed batch looks like downstream varies by
+        # module and by PyTorch version, so the invariant is asserted here
+        # instead of relying on any particular failure to surface it.
+        if not bool(mask.any(dim=1).all()):
+            raise ValueError("every clip must have at least one real frame")
+
+        h = x.reshape(N * V, T, C)
+        joint_mask = expand_mask_to_joints(mask, V)      # [N*V, T]
+        keep = joint_mask.unsqueeze(-1)                  # [N*V, T, 1]
+        # Taken from the expanded mask rather than expanded separately, so the
+        # lengths cannot drift out of alignment with `keep` and the fold.
+        joint_lengths = joint_mask.sum(dim=1)            # [N*V]
+
+        # Packing is mandatory, not an optimisation. Run unpacked, the backward
+        # LSTM starts at t = T-1 -- inside the padding -- and consumes padded
+        # steps before reaching any real frame, so every backward hidden state
+        # is computed from zeros it should never have seen. Nothing errors.
+        packed = nn.utils.rnn.pack_padded_sequence(
+            h, joint_lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = self.lstm(packed)
+        # total_length is required: without it the result is padded only to the
+        # longest sequence in this batch, which silently shrinks T whenever that
+        # is less than the padded length and breaks the seam residual.
+        out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out, batch_first=True, total_length=T
+        )
+
+        # pad_packed_sequence already zeroes the padded steps; re-zeroing keeps
+        # that an explicit guarantee of this cell rather than a detail borrowed
+        # from another module's behaviour.
+        out = out.masked_fill(~keep, 0.0)
+
+        return out.reshape(N, V, T, self.out_channels)
