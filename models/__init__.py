@@ -1,3 +1,4 @@
+from .graph import build_adjacency, build_edges, normalize_adjacency
 from .spatial import GAT, GCN
 from .temporal import (
     BiLSTMTemporalCell,
@@ -8,6 +9,9 @@ from .temporal import (
 from .model import STModel, masked_max_pool
 
 __all__ = [
+    "build_adjacency",
+    "build_edges",
+    "normalize_adjacency",
     "GCN",
     "GAT",
     "BiLSTMTemporalCell",
